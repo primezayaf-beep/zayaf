@@ -31,6 +31,23 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "@Avex_films_bot")
 OWNER_ID = int(os.getenv("OWNER_ID", os.getenv("ADMIN_ID", "0")))
 ADMIN_ID = OWNER_ID
+
+def parse_admin_ids(raw_value):
+    ids = set()
+    if not raw_value:
+        return ids
+    for part in str(raw_value).replace(" ", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            continue
+    return ids
+
+ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
+ADMIN_IDS.add(OWNER_ID)
 AI_HASH = os.getenv("AI_HASH", "")
 DONETV_CHANNEL = os.getenv("DONETV_CHANNEL", "")
 DB = os.getenv("DB_PATH", "kino_bot.db")
@@ -126,6 +143,11 @@ T = {
 def tr(lang, key):
     return T.get(lang, T["uz"]).get(key, T["uz"].get(key, key))
 
+
+def success_text(text):
+    return f"✅ <b>{text}</b>"
+
+
 async def get_lang(uid):
     async with aiosqlite.connect(DB) as db:
         cur = await db.execute("SELECT language FROM users WHERE id=?", (uid,))
@@ -157,7 +179,7 @@ async def db_init():
         CREATE TABLE IF NOT EXISTS channels(
             id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT UNIQUE NOT NULL,
             title TEXT DEFAULT '', username TEXT DEFAULT '', invite_link TEXT DEFAULT '',
-            kind TEXT DEFAULT 'public', added_at TEXT
+            kind TEXT DEFAULT 'public', required INTEGER DEFAULT 1, added_at TEXT
         );
         CREATE TABLE IF NOT EXISTS movies(
             id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE NOT NULL,
@@ -226,6 +248,11 @@ async def db_init():
             await db.execute("ALTER TABLE movies ADD COLUMN vip_only INTEGER DEFAULT 0")
         if "access_mode" not in movie_cols:
             await db.execute("ALTER TABLE movies ADD COLUMN access_mode TEXT DEFAULT 'all'")
+
+        cur = await db.execute("PRAGMA table_info(channels)")
+        channel_cols = {row[1] for row in await cur.fetchall()}
+        if "required" not in channel_cols:
+            await db.execute("ALTER TABLE channels ADD COLUMN required INTEGER DEFAULT 1")
         # Referral tizimi butunlay olib tashlandi.
         await db.execute("DROP TABLE IF EXISTS referrals")
         await db.execute("DELETE FROM settings WHERE key IN ('referral_enabled','referral_bonus_days')")
@@ -261,12 +288,17 @@ async def db_init():
                         (chat_id,title,username,f"https://t.me/{username}","public",datetime.now().isoformat())
                     )
                 await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('donetv_seeded','1')")
-        await db.execute("""
-            INSERT INTO admins(user_id,can_movies,can_users,can_broadcast,can_channels,
-            can_stats,can_admins,can_vip,can_support,can_logs,added_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(user_id) DO NOTHING
-        """,(OWNER_ID,1,1,1,1,1,1,1,1,1,datetime.now().isoformat()))
+        for admin_uid in sorted(ADMIN_IDS):
+            await db.execute("""
+                INSERT INTO admins(user_id,can_movies,can_users,can_broadcast,can_channels,
+                can_stats,can_admins,can_vip,can_support,can_logs,added_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(user_id) DO UPDATE SET can_movies=excluded.can_movies,
+                can_users=excluded.can_users,can_broadcast=excluded.can_broadcast,
+                can_channels=excluded.can_channels,can_stats=excluded.can_stats,
+                can_admins=excluded.can_admins,can_vip=excluded.can_vip,
+                can_support=excluded.can_support,can_logs=excluded.can_logs
+            """,(admin_uid,1,1,1,1,1,1,1,1,1,datetime.now().isoformat()))
         # Example plans only if database is empty.
         cur = await db.execute("SELECT COUNT(*) FROM vip_plans")
         if (await cur.fetchone())[0] == 0:
@@ -323,7 +355,8 @@ PERMS={"movies":"can_movies","users":"can_users","broadcast":"can_broadcast",
        "vip":"can_vip","support":"can_support","logs":"can_logs"}
 
 async def admin_right(uid, perm):
-    if uid==OWNER_ID: return True
+    if uid in ADMIN_IDS:
+        return True
     col=PERMS.get(perm)
     if not col: return False
     async with aiosqlite.connect(DB) as db:
@@ -332,7 +365,9 @@ async def admin_right(uid, perm):
     return bool(r and r[0])
 
 async def admin_exists(uid):
-    return await admin_right(uid,"movies") or uid==OWNER_ID or any(
+    if uid in ADMIN_IDS:
+        return True
+    return await admin_right(uid,"movies") or any(
         [await admin_right(uid,p) for p in PERMS]
     )
 
@@ -372,30 +407,28 @@ def lang_kb():
 
 def user_kb(lang="uz"):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👤 Profil",callback_data="profile"),
-         InlineKeyboardButton(text="🏆 Reyting",callback_data="ranking")],
-        [InlineKeyboardButton(text="❤️ Sevimlilar",callback_data="favorites"),
-         InlineKeyboardButton(text="🔔 Xabarnomalar",callback_data="notifications")],
-        [InlineKeyboardButton(text="🤖 AI Kino qidiruv",callback_data="ai_web_start")],
+        [InlineKeyboardButton(text="✅ Profil",callback_data="profile"),
+         InlineKeyboardButton(text="⭐ Reyting",callback_data="ranking"),
+         InlineKeyboardButton(text="💚 Sevimlilar",callback_data="favorites")],
+        [InlineKeyboardButton(text="🔔 Xabarnomalar",callback_data="notifications"),
+         InlineKeyboardButton(text="🤖 AI qidiruv",callback_data="ai_web_start"),
+         InlineKeyboardButton(text="⚙️ Sozlamalar",callback_data="settings")],
         [InlineKeyboardButton(text="🆘 Support",callback_data="support_start")],
-        [InlineKeyboardButton(text="⚙️ Sozlamalar",callback_data="settings")],
     ])
 
 def admin_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎬 Kino boshqaruvi",callback_data="manage_movies")],
-        [InlineKeyboardButton(text="🛠 Ommaviy tahrirlash/o'chirish",callback_data="bulk_movies")],
-        [InlineKeyboardButton(text="📺 Serial qismi",callback_data="add_episode")],
-        [InlineKeyboardButton(text="🎥 Kino kanalini sozlash",callback_data="movie_channel")],
-        [InlineKeyboardButton(text="📢 Majburiy obuna",callback_data="channels_menu")],
-        [InlineKeyboardButton(text="👑 Adminlar",callback_data="admins_menu")],
-        [InlineKeyboardButton(text="👥 Userlar",callback_data="users_menu")],
-        [InlineKeyboardButton(text="📨 Xabar yuborish",callback_data="broadcast_start")],
-        [InlineKeyboardButton(text="↪️ Forward xabar",callback_data="forward_broadcast_start")],
-        [InlineKeyboardButton(text="🤖 AI / Web sozlamalari",callback_data="ai_web_admin")],
-        [InlineKeyboardButton(text="🆘 Support",callback_data="support_admin")],
-        [InlineKeyboardButton(text="📝 Admin Log",callback_data="admin_logs")],
-        [InlineKeyboardButton(text="📊 Statistika",callback_data="advanced_stats")],
+        [InlineKeyboardButton(text="🎬 Kino",callback_data="manage_movies"),
+         InlineKeyboardButton(text="📺 Serial",callback_data="add_episode"),
+         InlineKeyboardButton(text="📢 Obuna",callback_data="channels_menu")],
+        [InlineKeyboardButton(text="👑 Adminlar",callback_data="admins_menu"),
+         InlineKeyboardButton(text="👥 Userlar",callback_data="users_menu"),
+         InlineKeyboardButton(text="📨 Xabar",callback_data="broadcast_start")],
+        [InlineKeyboardButton(text="↪️ Forward",callback_data="forward_broadcast_start"),
+         InlineKeyboardButton(text="🤖 AI / Web",callback_data="ai_web_admin"),
+         InlineKeyboardButton(text="📝 Log",callback_data="admin_logs")],
+        [InlineKeyboardButton(text="📊 Statistika",callback_data="advanced_stats"),
+         InlineKeyboardButton(text="🆘 Support",callback_data="support_admin")],
     ])
 
 def movie_kb(mid):
@@ -414,10 +447,12 @@ def movie_kb(mid):
 # ============================================================
 async def subscription_kb():
     async with aiosqlite.connect(DB) as db:
-        cur=await db.execute("SELECT id,title,username,invite_link,kind FROM channels ORDER BY id")
+        cur=await db.execute("SELECT id,title,username,invite_link,kind FROM channels WHERE COALESCE(required,1)=1 ORDER BY id")
         rows=await cur.fetchall()
     buttons=[]
     for cid,title,username,invite,kind in rows:
+        if not (title or username or invite):
+            continue
         url=invite or (f"https://t.me/{username.lstrip('@')}" if username else None)
         if url: buttons.append([InlineKeyboardButton(text=f"📢 {title or username or cid}",url=url)])
     buttons.append([InlineKeyboardButton(text="✅ Obunani tekshirish",callback_data="check_sub")])
@@ -425,19 +460,18 @@ async def subscription_kb():
 
 async def check_subscription(uid):
     async with aiosqlite.connect(DB) as db:
-        cur=await db.execute("SELECT chat_id,title,username,kind FROM channels")
+        cur=await db.execute("SELECT chat_id,title,username,kind FROM channels WHERE COALESCE(required,1)=1")
         channels=await cur.fetchall()
         cur=await db.execute("SELECT chat_id,status FROM join_requests WHERE user_id=?",(uid,))
         reqs={str(r[0]):r[1] for r in await cur.fetchall()}
     missing=[]
     for chat_id,title,username,kind in channels:
+        if not str(chat_id or "").strip():
+            continue
         try:
             m=await bot.get_chat_member(chat_id=chat_id,user_id=uid)
             if m.status in ("member","administrator","creator"):
                 continue
-            # For private groups/channels configured as request-based, a received join request
-            # is treated as satisfying the request requirement. The bot cannot query arbitrary
-            # pending join requests from Telegram; it can only know requests delivered to it.
             if kind == "private_request" and reqs.get(str(chat_id)) in ("pending","approved"):
                 continue
             if kind == "private" and reqs.get(str(chat_id)) in ("pending","approved"):
@@ -445,10 +479,12 @@ async def check_subscription(uid):
             if m.status in ("left","kicked"):
                 missing.append((chat_id,title,username,kind))
         except Exception as e:
+            err=str(e).lower()
+            if "chat not found" in err or "not found" in err or "username not found" in err:
+                continue
             if kind in ("private_request","private") and reqs.get(str(chat_id)) in ("pending","approved"):
                 continue
             missing.append((chat_id,title,username,kind))
-            logging.warning("Subscription check failed for %s: %s",chat_id,e)
     return missing
 
 @dp.chat_join_request()
@@ -479,7 +515,7 @@ async def check_sub(call):
     lang=await get_lang(call.from_user.id)
     if missing: await call.answer(tr(lang,"sub_no"),show_alert=True)
     else:
-        await call.answer(tr(lang,"sub_ok"),show_alert=True)
+        await call.answer(success_text(tr(lang,"sub_ok")),show_alert=True)
         await call.message.answer(tr(lang,"movie_code"))
 
 # ============================================================
@@ -491,7 +527,7 @@ async def set_lang(call):
     async with aiosqlite.connect(DB) as db:
         await db.execute("UPDATE users SET language=? WHERE id=?",(lang,call.from_user.id))
         await db.commit()
-    await call.answer(tr(lang,"lang_saved"))
+    await call.answer(success_text(tr(lang,"lang_saved")))
     await call.message.edit_text(tr(lang,"welcome"),reply_markup=user_kb(lang))
 
 @dp.callback_query(F.data=="settings")
@@ -870,7 +906,8 @@ async def channels_menu(call):
     if not await admin_right(call.from_user.id,"channels"): return await call.answer("⛔",show_alert=True)
     await call.message.answer("📢 <b>Majburiy obuna</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Kanal/guruh qo'shish",callback_data="add_channel")],
-        [InlineKeyboardButton(text="📋 Ulanganlar",callback_data="channel_list")],
+        [InlineKeyboardButton(text="📋 Barcha kanallar",callback_data="channel_list")],
+        [InlineKeyboardButton(text="✅ Majburiy tanlash",callback_data="select_required_channels")],
         [InlineKeyboardButton(text="🗑 O'chirish",callback_data="remove_channel")]
     ])); await call.answer()
 
@@ -887,32 +924,51 @@ async def add_channel_title(message,state):
     if not title: return await message.answer("❌ Kanal nomi bo‘sh bo‘lmasin.")
     await state.update_data(title=title)
     await state.set_state(AddChannel.link)
-    await message.answer("🔗 Kanal linkini yuboring.\nMasalan: <code>https://t.me/Univers_Filims</code>")
+    await message.answer("🔗 Kanal ID yoki linkini yuboring.\nMasalan: <code>@Univers_Filims</code>, <code>https://t.me/Univers_Filims</code> yoki <code>-1001234567890</code>")
 
 @dp.message(AddChannel.link)
 async def add_channel_link(message,state):
     link=message.text.strip()
     d=await state.get_data()
-    m=re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?$",link)
-    username=(m.group(1) if m else link.lstrip("@").strip())
-    if username.startswith("-100") and username[1:].isdigit():
-        chat_id=username
-        public_username=""
-        invite_link=link if link.startswith("http") else ""
-        kind="private"
-    elif re.fullmatch(r"[A-Za-z0-9_]{5,}",username):
-        chat_id="@"+username
-        public_username=username
-        invite_link=f"https://t.me/{username}"
-        kind="public"
+    raw_value = link.strip()
+    if raw_value.startswith("@"):
+        username = raw_value[1:]
+        invite_link = f"https://t.me/{username}"
+        chat_id = "@" + username
+        public_username = username
+        kind = "public"
+    elif raw_value.startswith("https://") or raw_value.startswith("http://"):
+        m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?$", raw_value)
+        username = (m.group(1) if m else raw_value.lstrip("@").strip())
+        if re.fullmatch(r"[A-Za-z0-9_]{5,}", username):
+            chat_id = "@" + username
+            public_username = username
+            invite_link = f"https://t.me/{username}"
+            kind = "public"
+        else:
+            chat_id = raw_value
+            public_username = ""
+            invite_link = raw_value
+            kind = "private"
+    elif re.fullmatch(r"-?\d{5,}", raw_value):
+        chat_id = raw_value
+        public_username = ""
+        invite_link = ""
+        kind = "private"
     else:
-        await state.clear()
-        return await message.answer("❌ Kanal manzili noto‘g‘ri. @username, t.me/username yoki -100... chat ID yuboring.")
+        username = raw_value.lstrip("@").strip()
+        if re.fullmatch(r"[A-Za-z0-9_]{5,}", username):
+            chat_id = "@" + username
+            public_username = username
+            invite_link = f"https://t.me/{username}"
+            kind = "public"
+        else:
+            await state.clear(); return await message.answer("❌ Kanal ID yoki link noto‘g‘ri. @username, https://t.me/username yoki -100... ID kiriting.")
     try:
-        chat=await bot.get_chat(chat_id)
-        title=chat.title or d["title"]
+        chat = await bot.get_chat(chat_id)
+        title = chat.title or d["title"]
     except Exception:
-        title=d["title"]
+        title = d["title"]
     try:
         async with aiosqlite.connect(DB) as db:
             await db.execute("INSERT INTO channels(chat_id,title,username,invite_link,kind,added_at) VALUES(?,?,?,?,?,?)",
@@ -928,10 +984,48 @@ async def add_channel_link(message,state):
 async def channel_list(call):
     if not await admin_right(call.from_user.id,"channels"): return await call.answer("⛔",show_alert=True)
     async with aiosqlite.connect(DB) as db:
-        cur=await db.execute("SELECT id,chat_id,title,username,kind FROM channels ORDER BY id"); rows=await cur.fetchall()
-    text="📋 <b>Ulanganlar</b>\n\n"
-    for i,c,t,u,k in rows: text+=f"#{i} {escape(t)} | {k} | <code>{c}</code> | @{escape(u or '-')}\n"
+        cur=await db.execute("SELECT id,chat_id,title,username,kind,required FROM channels ORDER BY id"); rows=await cur.fetchall()
+    text="📋 <b>Barcha kanallar/guruhlar</b>\n\n"
+    for i,c,t,u,k,r in rows:
+        status="✅ majburiy" if r else "❌ majburiy emas"
+        text+=f"#{i} {escape(t)} | {status} | {k} | <code>{c}</code> | @{escape(u or '-')}\n"
     await call.message.answer(text or "📭 Yo'q."); await call.answer()
+
+@dp.callback_query(F.data=="select_required_channels")
+async def select_required_channels(call):
+    if not await admin_right(call.from_user.id,"channels"): return await call.answer("⛔",show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        cur=await db.execute("SELECT id,title,username,chat_id,required FROM channels ORDER BY id")
+        rows=await cur.fetchall()
+    if not rows:
+        await call.message.answer("📭 Hozircha kanal/guruh yo'q. Avval qo'shing.")
+        return await call.answer()
+    kb=[]
+    for cid,title,username,chat_id,required in rows:
+        label = title or (f"@{username}" if username else str(chat_id))
+        status = "✅" if required else "❌"
+        kb.append([InlineKeyboardButton(text=f"{status} {label}", callback_data=f"toggle_required_channel:{cid}")])
+    kb.append([InlineKeyboardButton(text="↩️ Orqaga", callback_data="channels_menu")])
+    await call.message.answer("📌 <b>Majburiy bo'ladigan kanallarni tanlang</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("toggle_required_channel:"))
+async def toggle_required_channel(call):
+    if not await admin_right(call.from_user.id,"channels"): return await call.answer("⛔",show_alert=True)
+    try:
+        cid=int(call.data.split(":",1)[1])
+    except ValueError:
+        return await call.answer("❌ Noto'g'ri kanal",show_alert=True)
+    async with aiosqlite.connect(DB) as db:
+        cur=await db.execute("SELECT required,title FROM channels WHERE id=?",(cid,))
+        row=await cur.fetchone()
+        if not row:
+            return await call.answer("❌ Kanal topilmadi",show_alert=True)
+        required = 0 if row[0] else 1
+        await db.execute("UPDATE channels SET required=? WHERE id=?",(required,cid))
+        await db.commit()
+    await call.answer(f"{'✅ Majburiy qilindi' if required else '❌ Majburiy emas qilindi'}", show_alert=True)
+    await select_required_channels(call)
 
 class RemoveChannel(StatesGroup): value=State()
 
@@ -1011,7 +1105,7 @@ async def add_admin_permissions(message,state):
         can_admins=excluded.can_admins,can_vip=excluded.can_vip,can_support=excluded.can_support,can_logs=excluded.can_logs""",
         (d["user_id"],cols["movies"],cols["users"],cols["broadcast"],cols["channels"],cols["stats"],cols["admins"],cols["vip"],cols["support"],cols["logs"],datetime.now().isoformat()))
         await db.commit()
-    await log_action(message.from_user.id,"Admin qo'shildi",str(d["user_id"])); await state.clear(); await message.answer("✅ Admin qo'shildi.")
+    await log_action(message.from_user.id,"Admin qo'shildi",str(d["user_id"])); await state.clear(); await message.answer(success_text("Admin qo'shildi."))
 
 @dp.callback_query(F.data=="admin_list")
 async def admin_list(call):
