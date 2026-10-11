@@ -574,14 +574,32 @@ async def save_required_channel(chat_id,title,username,invite_link,kind):
 
 async def subscription_kb():
     async with aiosqlite.connect(DB) as db:
-        cur=await db.execute("SELECT id,title,username,invite_link,kind FROM channels WHERE COALESCE(required,1)=1 ORDER BY id")
+        cur=await db.execute("SELECT id,chat_id,title,username,invite_link,kind FROM channels WHERE COALESCE(required,1)=1 ORDER BY id")
         rows=await cur.fetchall()
     buttons=[]
-    for cid,title,username,invite,kind in rows:
-        if not (title or username or invite):
-            continue
+    for cid,chat_id,title,username,invite,kind in rows:
         url=invite or (f"https://t.me/{username.lstrip('@')}" if username else None)
-        if url: buttons.append([InlineKeyboardButton(text=f"📢 {title or username or cid}",url=url)])
+        if not url:
+            try:
+                chat=await bot.get_chat(chat_id)
+                username=chat.username or username
+                kind="public" if username else "private"
+                if username:
+                    url=f"https://t.me/{username}"
+                else:
+                    url=(await bot.create_chat_invite_link(chat_id=chat.id)).invite_link
+                async with aiosqlite.connect(DB) as db:
+                    await db.execute(
+                        "UPDATE channels SET title=?,username=?,invite_link=?,kind=? WHERE id=?",
+                        (chat.title or title,username or "",url,kind,cid),
+                    )
+                    await db.commit()
+            except TelegramAPIError as e:
+                logging.warning("Required chat invite link unavailable for %s: %s",chat_id,e)
+            except Exception:
+                logging.exception("Could not prepare required chat button for %s",chat_id)
+        if url:
+            buttons.append([InlineKeyboardButton(text=f"📢 {title or username or cid}",url=url)])
     buttons.append([InlineKeyboardButton(text="✅ Obunani tekshirish",callback_data="check_sub")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
