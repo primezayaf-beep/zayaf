@@ -486,10 +486,9 @@ async def check_subscription(uid):
                 missing.append((chat_id,title,username,kind))
         except Exception as e:
             err=str(e).lower()
-            if "chat not found" in err or "not found" in err or "username not found" in err:
-                continue
             if kind in ("private_request","private") and reqs.get(str(chat_id)) in ("pending","approved"):
                 continue
+            logging.warning("Required chat membership check failed for %s: %s",chat_id,e)
             missing.append((chat_id,title,username,kind))
     return missing
 
@@ -938,43 +937,49 @@ async def add_channel_link(message,state):
     d=await state.get_data()
     raw_value = link.strip()
     if raw_value.startswith("@"):
-        username = raw_value[1:]
-        invite_link = f"https://t.me/{username}"
-        chat_id = "@" + username
-        public_username = username
-        kind = "public"
+        username=raw_value[1:]
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,}",username):
+            return await message.answer("❌ Username noto'g'ri. @username yoki -100... chat ID yuboring.")
+        chat_id="@"+username
+        public_username=username
+        invite_link=f"https://t.me/{username}"
+        kind="public"
     elif raw_value.startswith("https://") or raw_value.startswith("http://"):
-        m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?$", raw_value)
-        username = (m.group(1) if m else raw_value.lstrip("@").strip())
-        if re.fullmatch(r"[A-Za-z0-9_]{5,}", username):
-            chat_id = "@" + username
-            public_username = username
-            invite_link = f"https://t.me/{username}"
-            kind = "public"
-        else:
-            chat_id = raw_value
-            public_username = ""
-            invite_link = raw_value
-            kind = "private"
+        m=re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]{5,})/?",raw_value)
+        if not m:
+            return await message.answer("❌ Invite-linkning o'zi bilan a'zolikni tekshirib bo'lmaydi. Public t.me/username yoki -100... chat ID yuboring.")
+        username=m.group(1)
+        chat_id="@"+username
+        public_username=username
+        invite_link=f"https://t.me/{username}"
+        kind="public"
     elif re.fullmatch(r"-?\d{5,}", raw_value):
-        chat_id = raw_value
-        public_username = ""
-        invite_link = ""
-        kind = "private"
+        chat_id=raw_value
+        public_username=""
+        invite_link=""
+        kind="private"
     else:
-        username = raw_value.lstrip("@").strip()
-        if re.fullmatch(r"[A-Za-z0-9_]{5,}", username):
-            chat_id = "@" + username
-            public_username = username
-            invite_link = f"https://t.me/{username}"
-            kind = "public"
-        else:
-            await state.clear(); return await message.answer("❌ Kanal ID yoki link noto‘g‘ri. @username, https://t.me/username yoki -100... ID kiriting.")
+        username=raw_value.lstrip("@").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_]{5,}",username):
+            return await message.answer("❌ Kanal manzili noto'g'ri. @username, t.me/username yoki -100... ID kiriting.")
+        chat_id="@"+username
+        public_username=username
+        invite_link=f"https://t.me/{username}"
+        kind="public"
     try:
-        chat = await bot.get_chat(chat_id)
-        title = chat.title or d["title"]
-    except Exception:
-        title = d["title"]
+        chat=await bot.get_chat(chat_id)
+        if chat.type not in ("channel","group","supergroup"):
+            return await message.answer("❌ Bu Telegram chat kanal yoki guruh emas.")
+        bot_member=await bot.get_chat_member(chat_id=chat.id,user_id=bot.id)
+        if bot_member.status not in ("administrator","creator"):
+            return await message.answer("❌ Bot guruh/kanalda admin emas. Telegram'da botni admin qilib, shu ID/linkni qayta yuboring.")
+        title=chat.title or d["title"]
+        chat_id=str(chat.id)
+        public_username=chat.username or public_username
+        if public_username:
+            invite_link=f"https://t.me/{public_username}"
+    except Exception as e:
+        return await message.answer(f"❌ Chatni tekshirib bo'lmadi. Botni guruhga qo'shing va admin qiling, keyin qayta urinib ko'ring.\n<code>{escape(str(e)[:250])}</code>")
     try:
         async with aiosqlite.connect(DB) as db:
             await db.execute("INSERT INTO channels(chat_id,title,username,invite_link,kind,added_at) VALUES(?,?,?,?,?,?)",
@@ -2118,8 +2123,11 @@ async def web_upload(request):
     return web.Response(text=f"Uploaded: {path}")
 
 async def start_web_server():
-    app=web.Application(client_max_size=MAX_UPLOAD_BYTES); app.router.add_get("/panel",web_panel); app.router.add_post("/panel/channel",web_channel); app.router.add_post("/panel/settings",web_settings); app.router.add_post("/panel/upload",web_upload)
+    app=web.Application(client_max_size=MAX_UPLOAD_BYTES); app.router.add_get("/healthz",web_health); app.router.add_get("/panel",web_panel); app.router.add_post("/panel/channel",web_channel); app.router.add_post("/panel/settings",web_settings); app.router.add_post("/panel/upload",web_upload)
     runner=web.AppRunner(app); await runner.setup(); await web.TCPSite(runner,WEB_HOST,WEB_PORT).start(); return runner
+
+async def web_health(request):
+    return web.Response(text="ok")
 
 async def main():
     await db_init()
