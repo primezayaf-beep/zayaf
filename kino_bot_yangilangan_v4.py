@@ -599,8 +599,12 @@ async def subscription_kb():
             except Exception:
                 logging.exception("Could not prepare required chat button for %s",chat_id)
         if url:
-            buttons.append([InlineKeyboardButton(text=f"📢 {title or username or cid}",url=url)])
-    buttons.append([InlineKeyboardButton(text="✅ Obunani tekshirish",callback_data="check_sub")])
+            buttons.append([InlineKeyboardButton(
+                text=f"📢 {title or username or cid}",url=url,style="primary",
+            )])
+    buttons.append([InlineKeyboardButton(
+        text="✅ Obunani tekshirish",callback_data="check_sub",style="success",
+    )])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 async def check_subscription(uid):
@@ -1053,7 +1057,7 @@ async def channels_menu(call):
         [InlineKeyboardButton(text="➕ Kanal/guruh qo'shish",callback_data="add_channel")],
         [InlineKeyboardButton(text="📋 Barcha kanallar",callback_data="channel_list")],
         [InlineKeyboardButton(text="✅ Majburiy tanlash",callback_data="select_required_channels")],
-        [InlineKeyboardButton(text="🗑 O'chirish",callback_data="remove_channel")]
+        [InlineKeyboardButton(text="🗑 O'chirish",callback_data="remove_channel",style="danger")]
     ])); await call.answer()
 
 @dp.callback_query(F.data=="add_channel")
@@ -1216,7 +1220,7 @@ async def remove_channel(call,state):
     kb=[]
     for cid,title,username,chat_id in rows:
         label=title or (f"@{username}" if username else str(chat_id))
-        kb.append([InlineKeyboardButton(text=f"🗑 {label}",callback_data=f"remove_channel:{cid}")])
+        kb.append([InlineKeyboardButton(text=f"🗑 {label}",callback_data=f"remove_channel:{cid}",style="danger")])
     kb.append([InlineKeyboardButton(text="↩️ Orqaga",callback_data="channels_menu")])
     await call.message.answer("🗑 <b>Qaysi kanalni o'chirasiz?</b>\n\nKerakli kanalni tugmadan tanlang:",reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await call.answer()
