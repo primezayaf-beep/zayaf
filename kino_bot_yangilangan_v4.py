@@ -1896,7 +1896,7 @@ async def admin_panel(message):
     if not await admin_exists(message.from_user.id): return await message.answer("⛔ Siz admin emassiz.")
     await message.answer("👑 <b>Admin panel</b>",reply_markup=admin_kb())
 
-@dp.message(F.text)
+@dp.message(F.text, F.chat.type == "private")
 async def code_handler(message):
     # FSM handlers take precedence in aiogram.
     await save_user(message)
