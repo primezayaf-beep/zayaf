@@ -64,6 +64,7 @@ WEB_PORT=int(os.getenv("WEB_PORT","8080"))
 WEB_OWNER_KEY=os.getenv("WEB_OWNER_KEY","")
 WEB_ADMIN_KEY=os.getenv("WEB_ADMIN_KEY","")
 MAX_UPLOAD_BYTES=int(os.getenv("MAX_UPLOAD_BYTES",str(500*1024**3)))
+MAX_REQUIRED_CHANNELS = 10
 
 if not BOT_TOKEN or not OWNER_ID:
     raise RuntimeError("BOT_TOKEN va OWNER_ID .env faylida bo'lishi kerak.")
@@ -550,6 +551,27 @@ def movie_kb(mid):
 # ============================================================
 # SUBSCRIPTION
 # ============================================================
+async def required_channel_count():
+    async with aiosqlite.connect(DB) as db:
+        cur=await db.execute("SELECT COUNT(*) FROM channels WHERE COALESCE(required,1)=1")
+        return (await cur.fetchone())[0]
+
+
+async def save_required_channel(chat_id,title,username,invite_link,kind):
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur=await db.execute("SELECT COUNT(*) FROM channels WHERE COALESCE(required,1)=1")
+        if (await cur.fetchone())[0] >= MAX_REQUIRED_CHANNELS:
+            await db.rollback()
+            return False
+        await db.execute(
+            "INSERT INTO channels(chat_id,title,username,invite_link,kind,required,added_at) VALUES(?,?,?,?,?,1,?)",
+            (chat_id,title,username,invite_link,kind,datetime.now().isoformat()),
+        )
+        await db.commit()
+    return True
+
+
 async def subscription_kb():
     async with aiosqlite.connect(DB) as db:
         cur=await db.execute("SELECT id,title,username,invite_link,kind FROM channels WHERE COALESCE(required,1)=1 ORDER BY id")
@@ -1008,7 +1030,8 @@ async def pending_payments(call):
 @dp.callback_query(F.data=="channels_menu")
 async def channels_menu(call):
     if not await admin_right(call.from_user.id,"channels"): return await call.answer("⛔",show_alert=True)
-    await call.message.answer("📢 <b>Majburiy obuna</b>",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    count=await required_channel_count()
+    await call.message.answer(f"📢 <b>Majburiy obuna</b>\n\nMajburiy kanal/guruhlar: {count}/{MAX_REQUIRED_CHANNELS}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Kanal/guruh qo'shish",callback_data="add_channel")],
         [InlineKeyboardButton(text="📋 Barcha kanallar",callback_data="channel_list")],
         [InlineKeyboardButton(text="✅ Majburiy tanlash",callback_data="select_required_channels")],
@@ -1018,6 +1041,8 @@ async def channels_menu(call):
 @dp.callback_query(F.data=="add_channel")
 async def add_channel_start(call,state):
     if not await admin_right(call.from_user.id,"channels"): return await call.answer("⛔",show_alert=True)
+    if await required_channel_count() >= MAX_REQUIRED_CHANNELS:
+        return await call.answer(f"❌ Eng ko'pi bilan {MAX_REQUIRED_CHANNELS} ta majburiy kanal/guruh qo'shish mumkin.",show_alert=True)
     await state.set_state(AddChannel.title)
     await call.message.answer("📢 Kanal nomini yuboring.\nMasalan: <code>UNIVERS FILIMS</code>")
     await call.answer()
@@ -1034,6 +1059,9 @@ async def add_channel_title(message,state):
 async def add_channel_link(message,state):
     link=message.text.strip()
     d=await state.get_data()
+    if await required_channel_count() >= MAX_REQUIRED_CHANNELS:
+        await state.clear()
+        return await message.answer(f"❌ Eng ko'pi bilan {MAX_REQUIRED_CHANNELS} ta majburiy kanal/guruh qo'shish mumkin.")
     raw_value = link.strip()
     if raw_value.startswith("@"):
         username=raw_value[1:]
@@ -1077,15 +1105,24 @@ async def add_channel_link(message,state):
         public_username=chat.username or public_username
         if public_username:
             invite_link=f"https://t.me/{public_username}"
+        else:
+            try:
+                invite_link=(await bot.create_chat_invite_link(chat_id=chat.id)).invite_link
+            except TelegramAPIError as e:
+                return await message.answer(
+                    "❌ Yopiq kanal/guruh uchun taklif havolasi yaratilmadi. "
+                    "Botga a'zo taklif qilish huquqini bering va qayta urinib ko'ring.\n"
+                    f"<code>{escape(str(e)[:250])}</code>"
+                )
     except Exception as e:
         return await message.answer(f"❌ Chatni tekshirib bo'lmadi. Botni guruhga qo'shing va admin qiling, keyin qayta urinib ko'ring.\n<code>{escape(str(e)[:250])}</code>")
     try:
-        async with aiosqlite.connect(DB) as db:
-            await db.execute("INSERT INTO channels(chat_id,title,username,invite_link,kind,added_at) VALUES(?,?,?,?,?,?)",
-                             (chat_id,title,public_username,invite_link,kind,datetime.now().isoformat()))
-            await db.commit()
+        saved=await save_required_channel(chat_id,title,public_username,invite_link,kind)
     except aiosqlite.IntegrityError:
         await state.clear(); return await message.answer("❌ Bu kanal/guruh allaqachon ulangan.")
+    if not saved:
+        await state.clear()
+        return await message.answer(f"❌ Eng ko'pi bilan {MAX_REQUIRED_CHANNELS} ta majburiy kanal/guruh qo'shish mumkin.")
     await log_action(message.from_user.id,"Majburiy obuna qo‘shildi",f"{title} {chat_id}")
     await state.clear()
     await message.answer(f"✅ <b>{escape(title)}</b> majburiy obunaga qo‘shildi.\n📢 {escape(chat_id)}")
@@ -1127,11 +1164,21 @@ async def toggle_required_channel(call):
     except ValueError:
         return await call.answer("❌ Noto'g'ri kanal",show_alert=True)
     async with aiosqlite.connect(DB) as db:
+        await db.execute("BEGIN IMMEDIATE")
         cur=await db.execute("SELECT required,title FROM channels WHERE id=?",(cid,))
         row=await cur.fetchone()
         if not row:
+            await db.rollback()
             return await call.answer("❌ Kanal topilmadi",show_alert=True)
         required = 0 if row[0] else 1
+        if required:
+            cur=await db.execute("SELECT COUNT(*) FROM channels WHERE COALESCE(required,1)=1")
+            if (await cur.fetchone())[0] >= MAX_REQUIRED_CHANNELS:
+                await db.rollback()
+                return await call.answer(
+                    f"❌ Eng ko'pi bilan {MAX_REQUIRED_CHANNELS} ta majburiy kanal/guruh bo'lishi mumkin.",
+                    show_alert=True,
+                )
         await db.execute("UPDATE channels SET required=? WHERE id=?",(required,cid))
         await db.commit()
     await call.answer(f"{'✅ Majburiy qilindi' if required else '❌ Majburiy emas qilindi'}", show_alert=True)
@@ -2186,17 +2233,46 @@ async def web_panel(request):
     if role=="owner":
         pack_name=escape(await get_setting("custom_emoji_pack"),quote=True)
         custom_emoji_section=f"""<section><h2>🎨 Custom emoji</h2><p>Telegram emoji to‘plami havolasi yoki nomini kiriting. Bo‘sh qoldirib saqlasangiz, custom emoji o‘chadi.</p><form method=post action='/panel/custom-emojis?key={key}'><input name=pack value="{pack_name}" placeholder='https://t.me/addemoji/emojiuzbek' style='width:65%'><button>To‘plamni saqlash</button></form></section>"""
-    html=f"""<!doctype html><meta charset=utf-8><meta name=viewport content=width=device-width,initial-scale=1><title>Kino Bot Panel</title><style>body{{font:16px Arial;max-width:1100px;margin:auto;padding:20px}}input,button{{padding:10px;margin:4px}}.card{{display:inline-block;border:1px solid #ddd;border-radius:10px;padding:15px;margin:5px}}section{{border:1px solid #ddd;border-radius:12px;padding:15px;margin:15px 0}}</style><h1>🎬 Kino Bot Panel</h1><p>Role: <b>{role}</b></p><div class=card>👥 {u} users</div><div class=card>🎬 {m} movies</div><div class=card>📢 {c} channels</div><section><h2>📢 Majburiy kanal</h2><form method=post action='/panel/channel?key={key}'><input name=title placeholder='Kanal nomi'><input name=chat_id placeholder='@kanal yoki -100...'><input name=username placeholder='username'><button>Qo‘shish</button></form></section>{custom_emoji_section}<section><h2>⚙️ Sozlamalar</h2><form method=post action='/panel/settings?key={key}'><input name=key_name placeholder='setting key'><input name=value placeholder='value'><button>Saqlash</button></form></section><section><h2>🎥 Katta video upload</h2><form method=post action='/panel/upload?key={key}' enctype=multipart/form-data><input name=code placeholder='Kino kodi'><input name=title placeholder='Kino nomi'><input type=file name=video><button>Serverga yuklash</button></form><p>Upload oqim bilan diskka yoziladi. Telegram orqali yuboriladigan fayllar esa Telegram Bot API limitlariga bog‘liq.</p></section>"""
+    html=f"""<!doctype html><meta charset=utf-8><meta name=viewport content=width=device-width,initial-scale=1><title>Kino Bot Panel</title><style>body{{font:16px Arial;max-width:1100px;margin:auto;padding:20px}}input,button{{padding:10px;margin:4px}}.card{{display:inline-block;border:1px solid #ddd;border-radius:10px;padding:15px;margin:5px}}section{{border:1px solid #ddd;border-radius:12px;padding:15px;margin:15px 0}}</style><h1>🎬 Kino Bot Panel</h1><p>Role: <b>{role}</b></p><div class=card>👥 {u} users</div><div class=card>🎬 {m} movies</div><div class=card>📢 {c} channels</div><section><h2>📢 Majburiy kanal/guruh</h2><p>Qo‘shilgan kanal va guruhlar botdagi obuna oynasida foydalanuvchilarga ko‘rinadi. Bot kanal/guruhda admin bo‘lishi shart; yopiq kanal/guruh uchun taklif havolasi avtomatik yaratiladi.</p><form method=post action='/panel/channel?key={key}'><input name=title placeholder='Kanal nomi'><input name=chat_id placeholder='@kanal yoki -100...'><input name=username placeholder='username'><button>Qo‘shish</button></form></section>{custom_emoji_section}<section><h2>⚙️ Sozlamalar</h2><form method=post action='/panel/settings?key={key}'><input name=key_name placeholder='setting key'><input name=value placeholder='value'><button>Saqlash</button></form></section><section><h2>🎥 Katta video upload</h2><form method=post action='/panel/upload?key={key}' enctype=multipart/form-data><input name=code placeholder='Kino kodi'><input name=title placeholder='Kino nomi'><input type=file name=video><button>Serverga yuklash</button></form><p>Upload oqim bilan diskka yoziladi. Telegram orqali yuboriladigan fayllar esa Telegram Bot API limitlariga bog‘liq.</p></section>"""
     return web.Response(text=html,content_type="text/html")
 
 async def web_channel(request):
     if _web_role(request) not in {"owner","admin"}: return web.Response(status=403,text="Forbidden")
-    d=await request.post(); title=str(d.get("title") or "Kanal"); chat_id=str(d.get("chat_id") or "").strip(); username=str(d.get("username") or "").strip().lstrip("@")
+    d=await request.post(); chat_id=str(d.get("chat_id") or "").strip()
     if not chat_id: return web.Response(status=400,text="chat_id required")
-    async with aiosqlite.connect(DB) as db:
+    try:
+        chat=await bot.get_chat(chat_id)
+    except TelegramAPIError as e:
+        return web.Response(status=400,text=f"Telegram chatni topmadi: {e}")
+    if chat.type not in ("channel","group","supergroup"):
+        return web.Response(status=400,text="Chat kanal yoki guruh bo'lishi kerak")
+    try:
+        bot_member=await bot.get_chat_member(chat_id=chat.id,user_id=bot.id)
+    except TelegramAPIError as e:
+        return web.Response(status=400,text=f"Botning chatdagi huquqlarini tekshirib bo'lmadi: {e}")
+    if bot_member.status not in ("administrator","creator"):
+        return web.Response(status=400,text="Botni kanal/guruhga admin qilib qayta urinib ko'ring")
+    username=chat.username or ""
+    if username:
+        invite_link=f"https://t.me/{username}"
+        kind="public"
+    else:
         try:
-            await db.execute("INSERT INTO channels(chat_id,title,username,invite_link,kind,added_at) VALUES(?,?,?,?,?,?)",(chat_id,title,username,(f"https://t.me/{username}" if username else ""),("public" if username else "private"),datetime.now().isoformat())); await db.commit()
-        except aiosqlite.IntegrityError: pass
+            invite_link=(await bot.create_chat_invite_link(chat_id=chat.id)).invite_link
+        except TelegramAPIError as e:
+            return web.Response(
+                status=400,
+                text=f"Yopiq kanal/guruh uchun taklif havolasi yaratilmadi. Botga a'zo taklif qilish huquqini bering: {e}",
+            )
+        kind="private"
+    try:
+        saved=await save_required_channel(
+            str(chat.id),chat.title or str(chat.id),username,invite_link,kind,
+        )
+    except aiosqlite.IntegrityError:
+        return web.Response(status=409,text="Channel already exists")
+    if not saved:
+        return web.Response(status=409,text=f"At most {MAX_REQUIRED_CHANNELS} required channels/groups are allowed")
     return web.Response(text="OK")
 
 async def web_settings(request):
