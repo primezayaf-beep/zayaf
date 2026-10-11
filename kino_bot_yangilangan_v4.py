@@ -262,7 +262,10 @@ async def db_init():
             "admin_receipt":"on",
             "maintenance":"off",
             "movie_channel_id":"",
-            "movie_channel_username":""
+            "movie_channel_username":"",
+            "news_channel_id":"",
+            "news_channel_link":"",
+            "news_channel_title":""
         }
         for k,v in defaults.items():
             await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
@@ -388,8 +391,10 @@ class BanUser(StatesGroup):
 class UnbanUser(StatesGroup): user_id=State()
 class AddAdmin(StatesGroup): user_id=State(); permissions=State()
 class RemoveAdmin(StatesGroup): user_id=State()
-class Broadcast(StatesGroup): source=State(); button=State()
-class ForwardBroadcast(StatesGroup): source=State()
+class Broadcast(StatesGroup): source=State(); button=State(); confirm=State()
+class ForwardBroadcast(StatesGroup): source=State(); confirm=State()
+class NewsChannel(StatesGroup): chat_id=State()
+class NewsPost(StatesGroup): source=State(); confirm=State()
 class Support(StatesGroup): message=State()
 class AddPlan(StatesGroup): name=State(); days=State(); price=State()
 class AddPaymentMethod(StatesGroup): name=State(); details=State()
@@ -424,6 +429,7 @@ def admin_kb():
         [InlineKeyboardButton(text="👑 Adminlar",callback_data="admins_menu"),
          InlineKeyboardButton(text="👥 Userlar",callback_data="users_menu"),
          InlineKeyboardButton(text="📨 Xabar",callback_data="broadcast_start")],
+        [InlineKeyboardButton(text="📰 Yangiliklar",callback_data="news_menu")],
         [InlineKeyboardButton(text="↪️ Forward",callback_data="forward_broadcast_start"),
          InlineKeyboardButton(text="🤖 AI / Web",callback_data="ai_web_admin"),
          InlineKeyboardButton(text="📝 Log",callback_data="admin_logs")],
@@ -1069,6 +1075,104 @@ async def remove_channel_do(call,state):
     await call.answer("✅ O'chirildi")
 
 # ============================================================
+# NEWS CHANNEL
+# ============================================================
+@dp.callback_query(F.data=="news_menu")
+async def news_menu(call):
+    if not await admin_right(call.from_user.id,"channels"):
+        return await call.answer("⛔ Ruxsat yo'q",show_alert=True)
+    channel_id=await get_setting("news_channel_id")
+    channel_title=await get_setting("news_channel_title")
+    status=f"✅ {escape(channel_title or channel_id)}" if channel_id else "❌ Hali kanal ulanmagan"
+    await call.message.answer(f"📰 <b>Yangiliklar bo'limi</b>\n\nKanal: {status}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Yangiliklar kanalini ulash",callback_data="news_channel_setup")],
+        [InlineKeyboardButton(text="✍️ Yangilik yuborish",callback_data="news_post_start")],
+        [InlineKeyboardButton(text="↩️ Admin panel",callback_data="back_admin")]
+    ]))
+    await call.answer()
+
+@dp.callback_query(F.data=="news_channel_setup")
+async def news_channel_setup(call,state):
+    if not await admin_right(call.from_user.id,"channels"):
+        return await call.answer("⛔ Ruxsat yo'q",show_alert=True)
+    await state.set_state(NewsChannel.chat_id)
+    await call.message.answer("📢 Yangiliklar kanalining @username, t.me/username linki yoki -100... chat ID sini yuboring. Private kanal uchun chat ID kerak; bot kanalda post yozish huquqiga ega admin bo'lishi shart.")
+    await call.answer()
+
+@dp.message(NewsChannel.chat_id)
+async def news_channel_save(message,state):
+    raw=(message.text or "").strip()
+    if raw.startswith("https://") or raw.startswith("http://"):
+        match=re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]{5,})/?",raw)
+        raw="@"+match.group(1) if match else raw
+    if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,}",raw):
+        target=raw
+    elif re.fullmatch(r"-?\d{5,}",raw):
+        target=raw
+    else:
+        return await message.answer("❌ Manzil tushunarsiz. @username, t.me/username yoki -100... ID yuboring. Private kanal uchun ID ishlating.")
+    try:
+        chat=await bot.get_chat(target)
+        member=await bot.get_chat_member(chat.id,bot.id)
+        if member.status not in ("administrator","creator"):
+            return await message.answer("❌ Bot bu kanalda admin emas. Botni kanalga admin qilib, qayta urinib ko'ring.")
+        if getattr(member,"can_post_messages",True) is False:
+            return await message.answer("❌ Botga kanalda post yozish huquqini bering.")
+    except Exception as e:
+        return await message.answer(f"❌ Kanalni tekshirib bo'lmadi. ID/linkni va bot huquqlarini tekshiring.\n<code>{escape(str(e)[:250])}</code>")
+    public_link=f"https://t.me/{chat.username}" if chat.username else ""
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO settings(key,value) VALUES('news_channel_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(chat.id),))
+        await db.execute("INSERT INTO settings(key,value) VALUES('news_channel_link',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(public_link,))
+        await db.execute("INSERT INTO settings(key,value) VALUES('news_channel_title',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(chat.title or str(chat.id),))
+        await db.commit()
+    await state.clear()
+    await message.answer(f"✅ Yangiliklar kanali ulandi: <b>{escape(chat.title or str(chat.id))}</b>")
+
+@dp.callback_query(F.data=="news_post_start")
+async def news_post_start(call,state):
+    if not await admin_right(call.from_user.id,"channels"):
+        return await call.answer("⛔ Ruxsat yo'q",show_alert=True)
+    channel_id=await get_setting("news_channel_id")
+    if not channel_id:
+        return await call.answer("Avval yangiliklar kanalini ulang",show_alert=True)
+    await state.set_state(NewsPost.source)
+    await call.message.answer("✍️ Kanalga yuboriladigan yangilik matni yoki media-xabarni shu yerga yuboring. Keyingi bosqichda yuborishni tasdiqlaysiz.")
+    await call.answer()
+
+@dp.message(NewsPost.source)
+async def news_post_prepare(message,state):
+    await state.update_data(chat_id=message.chat.id,message_id=message.message_id)
+    await state.set_state(NewsPost.confirm)
+    await message.answer("📰 Yangilik kanalga chiqarilsinmi?",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Kanalga yuborish",callback_data="news_post_confirm"),
+         InlineKeyboardButton(text="❌ Bekor qilish",callback_data="news_post_cancel")]
+    ]))
+
+@dp.callback_query(F.data=="news_post_confirm",NewsPost.confirm)
+async def news_post_confirm(call,state):
+    if not await admin_right(call.from_user.id,"channels"):
+        await state.clear()
+        return await call.answer("⛔ Ruxsat yo'q",show_alert=True)
+    data=await state.get_data()
+    channel_id=await get_setting("news_channel_id")
+    await state.clear()
+    try:
+        await bot.copy_message(channel_id,data["chat_id"],data["message_id"])
+        await call.message.answer("✅ Yangilik kanalga yuborildi.")
+        await call.answer("Yuborildi")
+        await log_action(call.from_user.id,"Yangilik kanalga post yuborildi",channel_id)
+    except Exception as e:
+        await call.answer("Kanalga yuborilmadi",show_alert=True)
+        await call.message.answer(f"❌ Post yuborilmadi: <code>{escape(str(e)[:250])}</code>")
+
+@dp.callback_query(F.data=="news_post_cancel",NewsPost.confirm)
+async def news_post_cancel(call,state):
+    await state.clear()
+    await call.answer("Bekor qilindi")
+    await call.message.answer("🛑 Yangilik yuborish bekor qilindi.")
+
+# ============================================================
 # ADMINS / USER BAN
 # ============================================================
 @dp.callback_query(F.data=="admins_menu")
@@ -1667,19 +1771,44 @@ async def broadcast_do(message,state):
         p=text.split("|",1)
         if len(p)!=2: return await message.answer("❌ Format noto'g'ri.")
         button_text,button_url=p[0].strip(),p[1].strip()
+        if not button_text or not re.fullmatch(r"https?://\S+",button_url):
+            return await message.answer("❌ Tugma uchun to'g'ri matn va http(s) link kiriting.")
+    async with aiosqlite.connect(DB) as db:
+        cur=await db.execute("SELECT id FROM users WHERE banned=0"); users=[r[0] for r in await cur.fetchall()]
+    await state.update_data(button_text=button_text,button_url=button_url,recipient_count=len(users))
+    await state.set_state(Broadcast.confirm)
+    await message.answer(f"📨 <b>Ommaviy xabar tayyor</b>\nQabul qiluvchilar: {len(users)}\n\nHaqiqatan yuborilsinmi?",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Yuborishni tasdiqlash",callback_data="broadcast_confirm"),
+         InlineKeyboardButton(text="❌ Bekor qilish",callback_data="broadcast_cancel")]
+    ]))
+
+@dp.callback_query(F.data=="broadcast_confirm",Broadcast.confirm)
+async def broadcast_confirm(call,state):
+    if not await admin_right(call.from_user.id,"broadcast"):
+        await state.clear()
+        return await call.answer("⛔ Ruxsat yo'q",show_alert=True)
+    d=await state.get_data()
+    await state.clear()
     async with aiosqlite.connect(DB) as db:
         cur=await db.execute("SELECT id FROM users WHERE banned=0"); users=[r[0] for r in await cur.fetchall()]
     sent=failed=0
     for uid in users:
         try:
-            mk=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text,url=button_url)]]) if button_text else None
+            mk=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=d["button_text"],url=d["button_url"])]]) if d.get("button_text") else None
             await bot.copy_message(uid,d["chat_id"],d["message_id"],reply_markup=mk); sent+=1
         except Exception as e:
             failed+=1
             logging.warning("Broadcast failed for %s: %s",uid,e)
         await asyncio.sleep(0.035)
-    await log_action(message.from_user.id,"Broadcast yuborildi",f"sent={sent},failed={failed}")
-    await state.clear(); await message.answer(f"📨 Tugadi.\n✅ {sent}\n❌ {failed}")
+    await log_action(call.from_user.id,"Broadcast yuborildi",f"sent={sent},failed={failed}")
+    await call.message.answer(f"📨 Tarqatish tugadi.\n✅ {sent}\n❌ {failed}")
+    await call.answer("Tarqatish yakunlandi")
+
+@dp.callback_query(F.data=="broadcast_cancel",Broadcast.confirm)
+async def broadcast_cancel(call,state):
+    await state.clear()
+    await call.answer("Bekor qilindi")
+    await call.message.answer("🛑 Ommaviy xabar bekor qilindi. Hech kimga yuborilmadi.")
 
 @dp.callback_query(F.data=="forward_broadcast_start")
 async def forward_broadcast_start(call,state):
@@ -1693,18 +1822,41 @@ async def forward_broadcast_do(message,state):
     async with aiosqlite.connect(DB) as db:
         cur=await db.execute("SELECT id FROM users WHERE banned=0")
         users=[r[0] for r in await cur.fetchall()]
+    await state.update_data(chat_id=message.chat.id,message_id=message.message_id,recipient_count=len(users))
+    await state.set_state(ForwardBroadcast.confirm)
+    await message.answer(f"↪️ <b>Forward xabar tayyor</b>\nQabul qiluvchilar: {len(users)}\n\nHaqiqatan forward qilinsinmi?",reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Forward qilish",callback_data="forward_broadcast_confirm"),
+         InlineKeyboardButton(text="❌ Bekor qilish",callback_data="forward_broadcast_cancel")]
+    ]))
+
+@dp.callback_query(F.data=="forward_broadcast_confirm",ForwardBroadcast.confirm)
+async def forward_broadcast_confirm(call,state):
+    if not await admin_right(call.from_user.id,"broadcast"):
+        await state.clear()
+        return await call.answer("⛔ Ruxsat yo'q",show_alert=True)
+    d=await state.get_data()
+    await state.clear()
+    async with aiosqlite.connect(DB) as db:
+        cur=await db.execute("SELECT id FROM users WHERE banned=0")
+        users=[r[0] for r in await cur.fetchall()]
     sent=failed=0
     for uid in users:
         try:
-            await bot.forward_message(chat_id=uid,from_chat_id=message.chat.id,message_id=message.message_id)
+            await bot.forward_message(chat_id=uid,from_chat_id=d["chat_id"],message_id=d["message_id"])
             sent+=1
         except Exception as e:
             failed+=1
             logging.warning("Forward broadcast failed for %s: %s",uid,e)
         await asyncio.sleep(0.035)
-    await log_action(message.from_user.id,"Forward broadcast yuborildi",f"sent={sent},failed={failed}")
+    await log_action(call.from_user.id,"Forward broadcast yuborildi",f"sent={sent},failed={failed}")
+    await call.message.answer(f"↪️ Forward tugadi.\n✅ {sent}\n❌ {failed}")
+    await call.answer("Forward yakunlandi")
+
+@dp.callback_query(F.data=="forward_broadcast_cancel",ForwardBroadcast.confirm)
+async def forward_broadcast_cancel(call,state):
     await state.clear()
-    await message.answer(f"↪️ Forward tugadi.\n✅ {sent}\n❌ {failed}")
+    await call.answer("Bekor qilindi")
+    await call.message.answer("🛑 Forward bekor qilindi. Hech kimga yuborilmadi.")
 
 # ============================================================
 # SUPPORT ADMIN
