@@ -8,16 +8,20 @@ import base64
 import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
-from html import escape
+from html import escape, unescape
 
 import aiosqlite
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    BotCommand, InputFile, FSInputFile, ChatJoinRequest
+    BotCommand, BotCommandScopeAllPrivateChats, InputFile, FSInputFile, ChatJoinRequest
 )
+from aiogram.types import InlineKeyboardButton as TelegramInlineKeyboardButton
+from aiogram.client.default import Default
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -49,7 +53,6 @@ def parse_admin_ids(raw_value):
 ADMIN_IDS = parse_admin_ids(os.getenv("ADMIN_IDS", ""))
 ADMIN_IDS.add(OWNER_ID)
 AI_HASH = os.getenv("AI_HASH", "")
-DONETV_CHANNEL = os.getenv("DONETV_CHANNEL", "")
 DB = os.getenv("DB_PATH", "kino_bot.db")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6-luna")
@@ -66,8 +69,79 @@ if not BOT_TOKEN or not OWNER_ID:
     raise RuntimeError("BOT_TOKEN va OWNER_ID .env faylida bo'lishi kerak.")
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(BOT_TOKEN)
+CUSTOM_EMOJI_IDS = {}
+TELEGRAM_HTML_TAG = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler|span|blockquote|tg-emoji)"
+    r"(?:\s+[^<>]*)?\s*/?>",
+    re.IGNORECASE,
+)
+
+
+def InlineKeyboardButton(*, text, **kwargs):
+    kwargs.setdefault("style", "success")
+    return TelegramInlineKeyboardButton(text=text, **kwargs)
+
+
+def custom_emoji_text(text):
+    if not CUSTOM_EMOJI_IDS:
+        return text
+    emoji_pattern = re.compile(
+        "|".join(re.escape(emoji) for emoji in sorted(CUSTOM_EMOJI_IDS, key=len, reverse=True))
+    )
+    parts = re.split(r"(<[^>]*>)", text)
+    for index, part in enumerate(parts):
+        if index % 2 and TELEGRAM_HTML_TAG.fullmatch(part):
+            continue
+        safe_text = escape(unescape(part), quote=False)
+        parts[index] = emoji_pattern.sub(
+            lambda match: (
+                f'<tg-emoji emoji-id="{CUSTOM_EMOJI_IDS[match.group(0)]}">'
+                f'{match.group(0)}</tg-emoji>'
+            ),
+            safe_text,
+        )
+    return "".join(parts)
+
+
+def custom_emoji_method(method):
+    for text_field, entities_field in (("text", "entities"), ("caption", "caption_entities")):
+        text = getattr(method, text_field, None)
+        if not isinstance(text, str) or getattr(method, entities_field, None):
+            continue
+        parse_mode = getattr(method, "parse_mode", None)
+        if parse_mode not in (None, "HTML") and not isinstance(parse_mode, Default):
+            continue
+        transformed = custom_emoji_text(text)
+        if transformed != text:
+            return method.model_copy(update={text_field: transformed, "parse_mode": "HTML"})
+    return method
+
+
+class CustomEmojiSession(AiohttpSession):
+    async def make_request(self, bot, method, timeout=None):
+        return await super().make_request(bot, custom_emoji_method(method), timeout)
+
+
+bot = Bot(BOT_TOKEN, session=CustomEmojiSession())
 dp = Dispatcher(storage=MemoryStorage())
+
+
+class PrivateChatOnlyMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if isinstance(event, Message) and event.chat.type != "private":
+            return None
+        if (
+            isinstance(event, CallbackQuery)
+            and event.message is not None
+            and event.message.chat.type != "private"
+        ):
+            await event.answer()
+            return None
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(PrivateChatOnlyMiddleware())
+dp.callback_query.outer_middleware(PrivateChatOnlyMiddleware())
 
 # ============================================================
 # TRANSLATIONS
@@ -270,27 +344,30 @@ async def db_init():
         for k,v in defaults.items():
             await db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",(k,v))
 
-        # DONETV_CHANNEL .env orqali birinchi ishga tushishda majburiy kanal sifatida qo'shiladi.
-        # Keyinchalik kanalni Admin -> Majburiy obuna bo'limidan botning o'zidan boshqarish mumkin.
-        if DONETV_CHANNEL:
-            cur = await db.execute("SELECT value FROM settings WHERE key='donetv_seeded'")
-            seeded = await cur.fetchone()
-            if not seeded:
-                raw = DONETV_CHANNEL.strip()
-                m = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?$", raw)
-                username = m.group(1) if m else raw.lstrip("@").strip()
-                if re.fullmatch(r"[A-Za-z0-9_]{5,}", username):
-                    chat_id = "@" + username
-                    try:
-                        chat = await bot.get_chat(chat_id)
-                        title = chat.title or username
-                    except Exception:
-                        title = username
-                    await db.execute(
-                        "INSERT OR IGNORE INTO channels(chat_id,title,username,invite_link,kind,added_at) VALUES(?,?,?,?,?,?)",
-                        (chat_id,title,username,f"https://t.me/{username}","public",datetime.now().isoformat())
-                    )
-                await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('donetv_seeded','1')")
+        cur = await db.execute("SELECT value FROM settings WHERE key='donetv_seeded'")
+        if await cur.fetchone():
+            old_seed = os.getenv("DONETV_CHANNEL", "").strip()
+            match = re.search(r"(?:https?://)?t\.me/([A-Za-z0-9_]{5,})/?$", old_seed)
+            old_username = match.group(1) if match else old_seed.lstrip("@").strip()
+            if re.fullmatch(r"[A-Za-z0-9_]{5,}", old_username):
+                await db.execute(
+                    "DELETE FROM channels WHERE lower(trim(username, '@'))=?",
+                    (old_username.lower(),),
+                )
+            await db.execute("DELETE FROM settings WHERE key='donetv_seeded'")
+        cur = await db.execute("SELECT value FROM settings WHERE key='legacy_channels_cleaned'")
+        if not await cur.fetchone():
+            await db.execute("""
+                DELETE FROM channels
+                WHERE lower(trim(username, '@')) IN ('tucosprofit', 'a_toolsx2')
+                   OR lower(trim(chat_id, '@')) IN ('tucosprofit', 'a_toolsx2')
+                   OR lower(rtrim(trim(invite_link), '/')) IN (
+                        'https://t.me/tucosprofit', 'https://t.me/a_toolsx2'
+                   )
+            """)
+            await db.execute(
+                "INSERT INTO settings(key,value) VALUES('legacy_channels_cleaned','1')"
+            )
         for admin_uid in sorted(ADMIN_IDS):
             await db.execute("""
                 INSERT INTO admins(user_id,can_movies,can_users,can_broadcast,can_channels,
@@ -346,6 +423,28 @@ async def set_setting(k,v):
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,v))
         await db.commit()
+
+
+def emoji_pack_name(value):
+    value = value.strip()
+    match = re.fullmatch(r"(?:https?://)?t\.me/addemoji/([A-Za-z0-9_]{1,64})/?", value)
+    if match:
+        return match.group(1)
+    if re.fullmatch(r"[A-Za-z0-9_]{1,64}", value):
+        return value
+    raise ValueError("Telegram custom emoji to'plami havolasi noto'g'ri.")
+
+
+async def fetch_custom_emoji_mapping(pack_name):
+    sticker_set = await bot.get_sticker_set(pack_name)
+    mapping = {}
+    for sticker in sticker_set.stickers:
+        if sticker.emoji and sticker.custom_emoji_id:
+            mapping.setdefault(sticker.emoji, sticker.custom_emoji_id)
+    if not mapping:
+        raise ValueError("To'plamda ishlatish mumkin bo'lgan custom emoji topilmadi.")
+    return mapping
+
 
 async def log_action(admin_id, action, details=""):
     async with aiosqlite.connect(DB) as db:
@@ -2061,7 +2160,7 @@ async def code_handler(message):
     if banned: return await message.answer(f"🚫 Siz bloklangansiz.\nSabab: {escape(reason or '-')}")
     if not await require_subscription(message): return
     code=message.text.strip()
-    if not code.isdigit(): return await message.answer(tr(await get_lang(uid),"movie_code"))
+    if not code.isdigit(): return
     async with aiosqlite.connect(DB) as db:
         cur=await db.execute("""SELECT id,code,title,description,genre,year,media_type,file_id,views,vip_only,access_mode,created_at
         FROM movies WHERE code=?""",(code,)); movie=await cur.fetchone()
@@ -2082,8 +2181,12 @@ async def web_panel(request):
         u=(await (await db.execute("SELECT COUNT(*) FROM users")).fetchone())[0]
         m=(await (await db.execute("SELECT COUNT(*) FROM movies")).fetchone())[0]
         c=(await (await db.execute("SELECT COUNT(*) FROM channels")).fetchone())[0]
-    key=request.query.get("key","")
-    html=f"""<!doctype html><meta charset=utf-8><meta name=viewport content=width=device-width,initial-scale=1><title>Kino Bot Panel</title><style>body{{font:16px Arial;max-width:1100px;margin:auto;padding:20px}}input,button{{padding:10px;margin:4px}}.card{{display:inline-block;border:1px solid #ddd;border-radius:10px;padding:15px;margin:5px}}section{{border:1px solid #ddd;border-radius:12px;padding:15px;margin:15px 0}}</style><h1>🎬 Kino Bot Web Panel</h1><p>Role: <b>{role}</b></p><div class=card>👥 {u} users</div><div class=card>🎬 {m} movies</div><div class=card>📢 {c} channels</div><section><h2>📢 Majburiy kanal</h2><form method=post action='/panel/channel?key={key}'><input name=title placeholder='Kanal nomi'><input name=chat_id placeholder='@kanal yoki -100...'><input name=username placeholder='username'><button>Qo‘shish</button></form></section><section><h2>⚙️ Sozlamalar</h2><form method=post action='/panel/settings?key={key}'><input name=key_name placeholder='setting key'><input name=value placeholder='value'><button>Saqlash</button></form></section><section><h2>🎥 Katta video upload</h2><form method=post action='/panel/upload?key={key}' enctype=multipart/form-data><input name=code placeholder='Kino kodi'><input name=title placeholder='Kino nomi'><input type=file name=video><button>Serverga yuklash</button></form><p>Upload oqim bilan diskka yoziladi. Telegram orqali yuboriladigan fayllar esa Telegram Bot API limitlariga bog‘liq.</p></section>"""
+    key=escape(request.query.get("key",""),quote=True)
+    custom_emoji_section=""
+    if role=="owner":
+        pack_name=escape(await get_setting("custom_emoji_pack"),quote=True)
+        custom_emoji_section=f"""<section><h2>🎨 Custom emoji</h2><p>Telegram emoji to‘plami havolasi yoki nomini kiriting. Bo‘sh qoldirib saqlasangiz, custom emoji o‘chadi.</p><form method=post action='/panel/custom-emojis?key={key}'><input name=pack value="{pack_name}" placeholder='https://t.me/addemoji/emojiuzbek' style='width:65%'><button>To‘plamni saqlash</button></form></section>"""
+    html=f"""<!doctype html><meta charset=utf-8><meta name=viewport content=width=device-width,initial-scale=1><title>Kino Bot Panel</title><style>body{{font:16px Arial;max-width:1100px;margin:auto;padding:20px}}input,button{{padding:10px;margin:4px}}.card{{display:inline-block;border:1px solid #ddd;border-radius:10px;padding:15px;margin:5px}}section{{border:1px solid #ddd;border-radius:12px;padding:15px;margin:15px 0}}</style><h1>🎬 Kino Bot Panel</h1><p>Role: <b>{role}</b></p><div class=card>👥 {u} users</div><div class=card>🎬 {m} movies</div><div class=card>📢 {c} channels</div><section><h2>📢 Majburiy kanal</h2><form method=post action='/panel/channel?key={key}'><input name=title placeholder='Kanal nomi'><input name=chat_id placeholder='@kanal yoki -100...'><input name=username placeholder='username'><button>Qo‘shish</button></form></section>{custom_emoji_section}<section><h2>⚙️ Sozlamalar</h2><form method=post action='/panel/settings?key={key}'><input name=key_name placeholder='setting key'><input name=value placeholder='value'><button>Saqlash</button></form></section><section><h2>🎥 Katta video upload</h2><form method=post action='/panel/upload?key={key}' enctype=multipart/form-data><input name=code placeholder='Kino kodi'><input name=title placeholder='Kino nomi'><input type=file name=video><button>Serverga yuklash</button></form><p>Upload oqim bilan diskka yoziladi. Telegram orqali yuboriladigan fayllar esa Telegram Bot API limitlariga bog‘liq.</p></section>"""
     return web.Response(text=html,content_type="text/html")
 
 async def web_channel(request):
@@ -2104,6 +2207,32 @@ async def web_settings(request):
         await db.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,v)); await db.commit()
     return web.Response(text="Saved")
 
+
+async def web_custom_emojis(request):
+    if _web_role(request)!="owner": return web.Response(status=403,text="Owner only")
+    form=await request.post()
+    pack=str(form.get("pack") or "").strip()
+    if not pack:
+        await set_setting("custom_emoji_pack","")
+        CUSTOM_EMOJI_IDS.clear()
+        return web.Response(text="Custom emoji to'plami o'chirildi.")
+    try:
+        pack_name=emoji_pack_name(pack)
+    except ValueError as e:
+        return web.Response(status=400,text=str(e))
+    try:
+        mapping=await fetch_custom_emoji_mapping(pack_name)
+    except ValueError as e:
+        return web.Response(status=400,text=str(e))
+    except TelegramAPIError as e:
+        logging.warning("Custom emoji pack load failed for %s: %s",pack_name,e)
+        return web.Response(status=502,text=f"Telegram to'plamni yuklay olmadi: {e}")
+    await set_setting("custom_emoji_pack",pack_name)
+    CUSTOM_EMOJI_IDS.clear()
+    CUSTOM_EMOJI_IDS.update(mapping)
+    return web.Response(text=f"Custom emoji to'plami saqlandi ({len(mapping)} ta emoji).")
+
+
 async def web_upload(request):
     if _web_role(request) not in {"owner","admin"}: return web.Response(status=403,text="Forbidden")
     reader=await request.multipart(); fields={}; path=None; total=0
@@ -2123,19 +2252,28 @@ async def web_upload(request):
     return web.Response(text=f"Uploaded: {path}")
 
 async def start_web_server():
-    app=web.Application(client_max_size=MAX_UPLOAD_BYTES); app.router.add_get("/healthz",web_health); app.router.add_get("/panel",web_panel); app.router.add_post("/panel/channel",web_channel); app.router.add_post("/panel/settings",web_settings); app.router.add_post("/panel/upload",web_upload)
+    app=web.Application(client_max_size=MAX_UPLOAD_BYTES); app.router.add_get("/healthz",web_health); app.router.add_get("/panel",web_panel); app.router.add_post("/panel/channel",web_channel); app.router.add_post("/panel/settings",web_settings); app.router.add_post("/panel/custom-emojis",web_custom_emojis); app.router.add_post("/panel/upload",web_upload)
     runner=web.AppRunner(app); await runner.setup(); await web.TCPSite(runner,WEB_HOST,WEB_PORT).start(); return runner
 
 async def web_health(request):
     return web.Response(text="ok")
 
 async def main():
+    global CUSTOM_EMOJI_IDS
     await db_init()
+    saved_pack=await get_setting("custom_emoji_pack")
+    if saved_pack:
+        try:
+            pack_name=emoji_pack_name(saved_pack)
+            CUSTOM_EMOJI_IDS=await fetch_custom_emoji_mapping(pack_name)
+        except (ValueError,TelegramAPIError) as e:
+            logging.error("Saved custom emoji pack could not be loaded: %s",e)
     web_runner=await start_web_server()
+    await bot.delete_my_commands()
     await bot.set_my_commands([
         BotCommand(command="start",description="Botni boshlash"),
         BotCommand(command="admin",description="Admin panel")
-    ])
+    ], scope=BotCommandScopeAllPrivateChats())
     try:
         await dp.start_polling(bot)
     finally:
